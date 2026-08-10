@@ -1,8 +1,17 @@
-require("dotenv").config();
+require("dotenv").config({ quiet: true });
 
 const Fastify = require("fastify");
 const fs = require("fs-extra");
 const path = require("path");
+const {
+  PROJECT_DIR,
+  ensureDataDir,
+  runtimeDirectory,
+  runtimeFile,
+  writeJsonAtomicSync
+} = require("./runtime_paths");
+const { isSpecialEventContent } = require("./special_events");
+const { decideRequestAccess } = require("./network_access");
 const {
   formatDateTimeInTimeZone,
   resolveTimeZone,
@@ -32,8 +41,11 @@ const IS_RAILWAY_RUNTIME = Boolean(
   process.env.RAILWAY_PROJECT_ID ||
   process.env.RAILWAY_SERVICE_ID
 );
-const TIMELINE_FILE = "enhanced_messages.json";
-const TIMESTAMP_DB_FILE = "./message_timestamps.json";
+// 批注 2026-08-10：默认路径仍是项目目录，保护本机/VPS 旧部署；Railway 挂载 Volume 后
+// DATA_DIR（或平台提供的 RAILWAY_VOLUME_MOUNT_PATH）统一承载时间线、时间戳、预设和日记。
+const DATA_DIR = ensureDataDir();
+const TIMELINE_FILE = runtimeFile("enhanced_messages.json");
+const TIMESTAMP_DB_FILE = runtimeFile("message_timestamps.json");
 // 批注 2026-07-17：管理页保存 .env 后要让 PM2 刷新进程环境；保留原进程名，
 // 只补 --update-env，避免用户改完推送配置却继续运行旧值。
 const DEFAULT_RESTART_COMMAND = "pm2 restart gateway wake-up --update-env";
@@ -213,7 +225,7 @@ function saveTimeline(messages) {
   const nonSP = messages.filter(m => m.role !== "system");
   const trimmed = nonSP.slice(-49);
   const final = sp ? [sp, ...trimmed] : trimmed;
-  fs.writeJsonSync(TIMELINE_FILE, final, { spaces: 2 });
+  writeJsonAtomicSync(TIMELINE_FILE, final);
 }
 
 // ========================
@@ -250,7 +262,7 @@ function loadTimestampDB() {
 }
 
 function saveTimestampDB(db) {
-  fs.writeJsonSync(TIMESTAMP_DB_FILE, db, { spaces: 2 });
+  writeJsonAtomicSync(TIMESTAMP_DB_FILE, db);
 }
 
 function makeFingerprint(msg) {
@@ -280,15 +292,7 @@ function extractTimestampWithMemory(msg, tsDB) {
 // ========================
 function isSpecialEvent(msg) {
   if (msg.role !== "assistant") return false;
-  const c = normalizeContentToText(msg.content);
-  // 批注 2026-07-11：推送渠道从 Bark 扩展到 ntfy；继续兼容早期时间线里的 Bark/宝宝事件，避免升级后旧唤醒事件丢失。
-  return (
-    c.includes("刚刚给宝宝发了 Bark") ||
-    c.includes("刚刚给用户发了 Bark") ||
-    c.includes("自动唤醒：本次未发送 Bark") ||
-    c.includes("自动唤醒：本次未发送推送") ||
-    (c.includes("刚刚给用户发了") && c.includes("推送"))
-  );
+  return isSpecialEventContent(normalizeContentToText(msg.content));
 }
 
 function isRealMessageForTimeline(msg) {
@@ -412,8 +416,9 @@ let wakeUpLastHeartbeat = null;
 // ========================
 // 预设方案
 // ========================
-const PRESETS_FILE = "./presets.json";
-const ENV_FILE = ".env";
+const PRESETS_FILE = runtimeFile("presets.json");
+// .env 是启动配置而不是运行数据；继续固定在代码目录，Railway 则始终以 Variables 为权威来源。
+const ENV_FILE = path.join(PROJECT_DIR, ".env");
 const PREFERRED_ENV_ORDER = [
   "TARGET_API_URL",
   "TARGET_API_KEY",
@@ -430,6 +435,9 @@ const PREFERRED_ENV_ORDER = [
   "NTFY_TAGS",
   "DIARY_ENABLED",
   "DIARY_DIR",
+  "DATA_DIR",
+  "PUSH_TIMEOUT_MS",
+  "WAKE_UPSTREAM_TIMEOUT_MS",
   "REQUEST_BODY_LIMIT_MB",
   "MULTIMODAL_MODE",
   "DAY_WAKE_AFTER_MINUTES",
@@ -457,7 +465,7 @@ function loadPresets() {
 }
 
 function savePresets(presets) {
-  fs.writeJsonSync(PRESETS_FILE, presets, { spaces: 2 });
+  writeJsonAtomicSync(PRESETS_FILE, presets);
 }
 
 function wantsJsonResponse(req) {
@@ -504,37 +512,35 @@ function readRestartCommand() {
 }
 
 // ========================
-// 安全：放行 /admin，其他仅本地/局域网
+// 安全：管理页走 Basic Auth，/v1 按公开开关鉴权，内部写接口只允许同进程容器 localhost
 // ========================
 app.addHook("onRequest", (req, reply, done) => {
-  if (req.url.startsWith("/admin")) return done();
-  // 批注 2026-07-15：公网部署常经过反代，真实公网请求可能在 Node 侧显示为 127/10 网段；
-  // 所以 ALLOW_PUBLIC_API=true 后必须先验 /v1 的网关 key，避免被云平台内网 IP 绕过。
-  if (readBooleanEnv("ALLOW_PUBLIC_API", false) && req.url.startsWith("/v1/")) {
-    const configuredKey = readEnvValue("GATEWAY_API_KEY");
-    if (!configuredKey) {
-      reply.code(401).send({ error: "公网 /v1 已开启，但 GATEWAY_API_KEY 未配置" });
-      return;
-    }
-    const auth = String(req.headers.authorization || "");
-    const bearer = auth.match(/^Bearer\s+(.+)$/i)?.[1]?.trim() || "";
-    const headerKey = String(req.headers["x-gateway-api-key"] || req.headers["x-api-key"] || "").trim();
-    if (bearer === configuredKey || headerKey === configuredKey) return done();
+  const requestPath = req.url.split("?")[0];
+  const ip = String(req.ip || req.connection.remoteAddress || "");
+  const headerKey = String(req.headers["x-gateway-api-key"] || req.headers["x-api-key"] || "").trim();
+  const access = decideRequestAccess({
+    path: requestPath,
+    ip,
+    isRailway: IS_RAILWAY_RUNTIME,
+    allowPublicApi: readBooleanEnv("ALLOW_PUBLIC_API", false),
+    configuredKey: readEnvValue("GATEWAY_API_KEY"),
+    authorization: req.headers.authorization,
+    headerKey
+  });
+  if (access.allow) return done();
+  if (access.authRejected) {
     // 批注 2026-07-30：Kelivo 可能在模型探测或旧预设里继续带错 key；
     // 只记路径和 header 类型，帮助排查缓存/重复请求，绝不把任意密钥写入日志。
     console.warn(JSON.stringify({
       event: "gateway_auth_rejected",
-      path: req.url.split("?")[0],
-      auth_source: bearer ? "bearer" : headerKey ? "x-api-key" : "missing"
+      path: requestPath,
+      auth_source: access.authSource || "missing"
     }));
-    reply.code(401).send({ error: "Gateway API Key 无效或缺失" });
-    return;
   }
-  const ip = req.ip || req.connection.remoteAddress;
-  const isTrustedNetwork = ip === "127.0.0.1" || ip === "::1" || ip === "localhost" || /^(10\.|172\.(1[6-9]|2\d|3[01])\.|192\.168\.)/.test(ip);
-  if (isTrustedNetwork) return done();
-  reply.code(403).send("Forbidden");
+  reply.code(access.status || 403).send(access.status === 401 ? { error: access.error } : access.error);
 });
+
+app.get("/healthz", async () => ({ status: "ok" }));
 
 // ========================
 // Models
@@ -800,7 +806,7 @@ function normalizeWeatherUnits(value) {
 
 function diaryDirectoryPath() {
   const configured = readEnvValueOrDefault("DIARY_DIR", "diary");
-  return path.isAbsolute(configured) ? configured : path.join(process.cwd(), configured);
+  return runtimeDirectory(configured, "diary");
 }
 
 function readDiaryEntries(limit = 20) {
@@ -1729,7 +1735,15 @@ app.post("/admin/restart", { preHandler: basicAuth }, async (req, reply) => {
 // ========================
 // 测试 Bark
 // ========================
-app.get("/test-bark", async (req, reply) => {
+app.get("/test-bark", { preHandler: basicAuth }, async (req, reply) => {
+  const formattedTime = formatDateTimeInTimeZone(new Date(), TIME_ZONE);
+  appendSpecialEvent(`（${formattedTime} 刚刚给用户发了 Bark：这是一条测试推送。）`);
+  reply.send({ success: true });
+});
+
+// 批注 2026-08-10：公网测试入口归入 /admin 并沿用 Basic Auth；旧 /test-bark 只保留给本机兼容，
+// 避免平台反代把外部请求伪装成私网来源后向时间线写入假事件。
+app.get("/admin/test-bark", { preHandler: basicAuth }, async (req, reply) => {
   const formattedTime = formatDateTimeInTimeZone(new Date(), TIME_ZONE);
   appendSpecialEvent(`（${formattedTime} 刚刚给用户发了 Bark：这是一条测试推送。）`);
   reply.send({ success: true });
@@ -1743,5 +1757,16 @@ app.listen({ port: PORT, host: "0.0.0.0" }, (err, address) => {
     console.error(err);
     process.exit(1);
   }
+  // 只打印是否配置，不输出 URL、Key、用户名、聊天内容或 Volume 名称。
+  console.log(JSON.stringify({
+    event: "runtime_config_summary",
+    railway: IS_RAILWAY_RUNTIME,
+    persistent_data: Boolean(process.env.DATA_DIR || process.env.RAILWAY_VOLUME_MOUNT_PATH),
+    target_url_configured: Boolean(TARGET_API_URL),
+    target_key_configured: Boolean(process.env.TARGET_API_KEY),
+    model_configured: Boolean(process.env.MODEL_NAME),
+    gateway_key_configured: Boolean(readEnvValue("GATEWAY_API_KEY")),
+    data_dir_ready: fs.existsSync(DATA_DIR)
+  }));
   console.log(`✅ Gateway 运行在 ${address}`);
 });

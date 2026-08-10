@@ -236,6 +236,7 @@ NTFY_PRIORITY=
 NTFY_TAGS=
 DIARY_ENABLED=true
 DIARY_DIR=diary
+DATA_DIR=
 REQUEST_BODY_LIMIT_MB=50
 MULTIMODAL_MODE=passthrough
 DAY_WAKE_AFTER_MINUTES=60
@@ -327,10 +328,13 @@ RESTART_COMMAND=pm2 restart 你的gateway进程名 你的wake进程名 --update-
 
 Railway 使用环境变量（**Variables**）注入运行时配置，且没有挂载 Volume 时，容器内文件会在重新部署后消失。因此在 Railway 部署时：
 
-1. 请在 Railway 的 **Variables** 页面修改 `DAY_WAKE_AFTER_MINUTES`、`NIGHT_WAKE_AFTER_MINUTES`、检查间隔、`TIME_ZONE` 等配置。
-2. 修改后执行 Railway 的 Redeploy / Restart，让 `gateway` 与 `wake_up` 进程重新读取环境变量。
-3. `/admin` 的“保存配置”会写入当前容器的 `.env`；它适合本机、VPS 或已自行配置持久化磁盘的部署，**不应作为 Railway Variables 的替代品**。
-4. `/admin` 的默认“一键重启”执行的是 pm2 命令；Railway 没有自行安装 pm2 时，请在 Railway 控制台重新部署，而不是依赖该按钮。
+1. 请在 Railway 服务的 **Variables** 页面填写 `.env.example` 中需要的变量；修改后要应用 staged changes 并 Redeploy。
+2. 仓库中的 `railway.json` 会自动使用 `npm run start:railway`，在同一个服务里启动 Gateway 与 wake-up。不要拆成两个互不共享文件的 Railway Service；如果旧部署曾手动填写 Custom Start Command，请删除覆盖值，或直接改成 `npm run start:railway`。
+3. 若希望重新部署后仍保留 `enhanced_messages.json`、时间戳、预设和日记，请给这个服务添加 Volume，Mount Path 填 `/app/data`。程序会自动读取 Railway 提供的挂载路径；也可以显式设置 `DATA_DIR=/app/data`。
+4. `enhanced_messages.json` 不会出现在 GitHub 仓库中。它会在 Kelivo 第一次成功请求 Gateway 后生成在运行数据目录；没有 Volume 时，Redeploy 后旧文件会消失，但下一次 Kelivo 请求会创建一份新的时间线。
+5. `/admin` 的“保存配置”会写入当前容器的 `.env`；Railway Variables 仍是云端部署的权威配置源。Railway 没有 pm2 时，请在控制台 Redeploy，不要依赖管理页的一键重启。
+
+旧版本日志中的 `injected env (0) from .env` 只表示实体 `.env` 没有新增变量，不表示 Railway Variables 为空；新版已关闭这条容易误解的 dotenv 提示。启动日志会以布尔状态显示必要配置是否存在，但不会输出 Key、URL 或聊天内容。
 
 安全提示：
 
@@ -494,13 +498,14 @@ DIARY_ENABLED=false
 
 ## 🧪 测试推送
 
-在 Gateway 运行时，浏览器访问：
+在 Gateway 本机运行时访问：
 
 ```
 http://localhost:3000/test-bark
 ```
 
 这会在时间线中注入一条模拟推送事件（不真正发送到手机），用于验证排序。
+公网部署请登录管理页后访问 `/admin/test-bark`；兼容保留的旧 `/test-bark` 现在也要求相同的 Admin Basic Auth。
 
 ---
 
@@ -518,7 +523,7 @@ http://localhost:3000/test-bark
 
 1. 将项目上传到服务器或直接连接 GitHub 仓库
 2. 在平台的环境变量设置中填入 `.env` 中的所有参数
-3. 启动命令使用 `node server.js`，并确保 `wake_up.js` 同时运行（可使用 pm2 或平台多进程支持）
+3. Railway 会通过仓库自带的 `railway.json` 同时启动 Gateway 与 wake-up；其他平台需确保 `server.js` 和 `wake_up.js` 同时运行
 4. 如果希望远程访问管理页面，需配置 HTTPS 和域名，并修改 `ADMIN_USER` / `ADMIN_PASSWORD` 为强密码
 
 如果部署在 Railway / Render 这类公网平台，并且 Kelivo 需要从公网访问 Gateway，请额外设置：

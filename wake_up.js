@@ -1,7 +1,9 @@
-require("dotenv").config();
+require("dotenv").config({ quiet: true });
 const fs = require("fs");
 const path = require("path");
 const { buildNtfyPayload } = require("./ntfy_priority");
+const { ensureDataDir, runtimeDirectory, runtimeFile } = require("./runtime_paths");
+const { parseChatCompletionResponse } = require("./upstream_response");
 const {
   formatDateTimeInTimeZone,
   getDatePartsInTimeZone,
@@ -10,7 +12,9 @@ const {
   zonedWallTimeToDate
 } = require("./time_utils");
 
-const TIMELINE_PATH = path.join(__dirname, "enhanced_messages.json");
+// 批注 2026-08-10：与 Gateway 共用同一 DATA_DIR；未配置时仍落回项目目录，保护旧 VPS/本机部署。
+const DATA_DIR = ensureDataDir();
+const TIMELINE_PATH = runtimeFile("enhanced_messages.json");
 const PORT = Number(process.env.PORT) || 3000;
 const GATEWAY_BASE_URL = (process.env.GATEWAY_BASE_URL || `http://localhost:${PORT}`).replace(/\/+$/, "");
 const GATEWAY_URL = `${GATEWAY_BASE_URL}/internal/wake-event`;
@@ -18,9 +22,14 @@ const HEARTBEAT_URL = `${GATEWAY_BASE_URL}/internal/heartbeat`;
 const TIME_ZONE = resolveTimeZone();
 const WEATHER_TIMEOUT_MS = 5000;
 const DIARY_DIR_NAME = process.env.DIARY_DIR || "diary";
-const DIARY_DIR_PATH = path.isAbsolute(DIARY_DIR_NAME)
-  ? DIARY_DIR_NAME
-  : path.join(__dirname, DIARY_DIR_NAME);
+const DIARY_DIR_PATH = runtimeDirectory(DIARY_DIR_NAME, "diary");
+const PUSH_TIMEOUT_MS = readPositiveTimeout("PUSH_TIMEOUT_MS", 15_000);
+const WAKE_UPSTREAM_TIMEOUT_MS = readPositiveTimeout("WAKE_UPSTREAM_TIMEOUT_MS", 300_000);
+
+function readPositiveTimeout(key, fallback) {
+  const value = Number(process.env[key]);
+  return Number.isFinite(value) && value >= 1000 ? Math.floor(value) : fallback;
+}
 
 function readNumberEnv(key, fallback, options = {}) {
   const value = Number(process.env[key]);
@@ -100,6 +109,7 @@ async function sendPushNotification({ title, body }) {
 
     const response = await fetch(server, {
       method: "POST",
+      signal: AbortSignal.timeout(PUSH_TIMEOUT_MS),
       headers,
       body: JSON.stringify(payload)
     });
@@ -127,6 +137,7 @@ async function sendPushNotification({ title, body }) {
 
   const response = await fetch("https://api.day.app/push", {
     method: "POST",
+    signal: AbortSignal.timeout(PUSH_TIMEOUT_MS),
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify(barkPayload)
   });
@@ -471,6 +482,9 @@ ${historyText}`
 
   const response = await fetch(process.env.TARGET_API_URL, {
     method: "POST",
+    // 批注 2026-08-10：上游只建连不结束时，旧循环永远不会安排下一次检查；
+    // 五分钟默认总超时只作兜底，可由 WAKE_UPSTREAM_TIMEOUT_MS 调整。
+    signal: AbortSignal.timeout(WAKE_UPSTREAM_TIMEOUT_MS),
     headers: {
       "Content-Type": "application/json",
       Authorization: `Bearer ${process.env.TARGET_API_KEY}`
@@ -487,9 +501,9 @@ ${historyText}`
   const responseText = await response.text();
   let data;
   try {
-    data = JSON.parse(responseText);
-  } catch {
-    throw new Error(`模型返回的不是 JSON（HTTP ${response.status}）：${responseText.slice(0, 300)}`);
+    data = parseChatCompletionResponse(responseText, response.headers.get("content-type") || "");
+  } catch (error) {
+    throw new Error(`模型响应无法解析（HTTP ${response.status}）：${error.message || responseText.slice(0, 300)}`);
   }
   if (!response.ok) {
     throw new Error(`模型请求失败（HTTP ${response.status}）：${responseText.slice(0, 300)}`);
@@ -617,4 +631,14 @@ setTimeout(scheduleNextCheck, 10_000);
 
 console.log("\n==================================");
 console.log("Dylan Heartbeat Runtime 已启动（动态间隔）");
+console.log(JSON.stringify({
+  event: "wake_runtime_config_summary",
+  railway: Boolean(process.env.RAILWAY_ENVIRONMENT || process.env.RAILWAY_PROJECT_ID || process.env.RAILWAY_SERVICE_ID),
+  persistent_data: Boolean(process.env.DATA_DIR || process.env.RAILWAY_VOLUME_MOUNT_PATH),
+  target_url_configured: Boolean(process.env.TARGET_API_URL),
+  target_key_configured: Boolean(process.env.TARGET_API_KEY),
+  model_configured: Boolean(process.env.MODEL_NAME),
+  push_provider_configured: Boolean(process.env.BARK_KEY || process.env.NTFY_TOPIC),
+  data_dir_ready: fs.existsSync(DATA_DIR)
+}));
 console.log("==================================\n");
