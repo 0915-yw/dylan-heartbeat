@@ -529,16 +529,6 @@ ${historyText}`
     const noActionMatch = aiText.match(/^\[NO_ACTION\]\s*(.{0,20})?/);
     // AI 选择不发送推送
     console.log("\nAI 选择不发送推送\n");
-    //====临时强制测试Bark，测试完记得删掉====
-const barkKey = process.env.BARK_KEY;
-if(barkKey){
-  (async ()=>{
-    const testMsg = "🔔强制测试唤醒推送";
-    await fetch(`https://api.day.app/${barkKey}/${encodeURIComponent(testMsg)}`);
-    console.log("✅【强制测试】Bark测试消息已经发出");
-  })();
-}
-//======================================
     let reason = (noActionMatch[1] || "").trim();
     if (reason.startsWith("原因：") || reason.startsWith("原因:")) {
       reason = reason.replace(/^原因[：:]\s*/, "").trim();
